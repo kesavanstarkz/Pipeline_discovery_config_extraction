@@ -482,161 +482,105 @@ class ExportEngine:
         self, configs: List[PipelineConfig], raw_definitions: List[Dict]
     ) -> str:
         """
-        Step 5-11: Build a Deep-Inspection Export Package
-        Reconstructs the original folder structure, decodes Base64 payloads,
-        and applies dynamic mapping for linked resources.
+        Builds a Fabric UI Export format package using live definition data.
         """
         tmp_dir = tempfile.mkdtemp()
-        zip_path = os.path.join(tmp_dir, f"fabric_deep_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
+        zip_path = os.path.join(tmp_dir, f"fabric_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
 
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for i, config in enumerate(configs):
-                raw = raw_definitions[i] if i < len(raw_definitions) else {}
-                p_name = config.pipeline_name
-
-                parts_written = False
-                if "definition" in raw and "parts" in raw["definition"]:
-                    import base64
-                    for part in raw["definition"]["parts"]:
-                        path = part.get("path")
-                        payload = part.get("payload", "")
-                        try:
-                            decoded_str = base64.b64decode(payload).decode('utf-8')
-                            
-                            # Apply dynamic mapping if it's a JSON file
-                            if path and path.endswith(".json"):
-                                try:
-                                    parsed = json.loads(decoded_str)
-                                    parsed = self._apply_dynamic_mapping(parsed)
-                                    decoded_str = json.dumps(parsed, indent=2)
-                                except Exception:
-                                    pass
-                                    
-                            zf.writestr(f"{p_name}/{path}", decoded_str)
-                            parts_written = True
-                        except Exception as e:
-                            logger.error(f"Failed to decode part {path}: {e}")
-
-                if not parts_written:
-                    # Fallback if no parts are found
-                    deep_content = self._inline_dependencies(raw)
-                    schedules = self._construct_schedules(raw)
-                    platform = {
-                        "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
-                        "metadata": {
-                            "type": "DataPipeline",
-                            "displayName": p_name
-                        },
-                        "config": {
-                            "version": "2.0",
-                            "logicalId": "00000000-0000-0000-0000-000000000000"
-                        }
-                    }
-
-                    # Write separated files within a pipeline directory
-                    zf.writestr(f"{p_name}/pipeline-content.json", json.dumps(self._apply_dynamic_mapping(deep_content), indent=2))
-                    zf.writestr(f"{p_name}/.schedules", json.dumps(self._apply_dynamic_mapping(schedules), indent=2))
-                    zf.writestr(f"{p_name}/.platform", json.dumps(platform, indent=2))
+            for i, raw in enumerate(raw_definitions):
+                # Ensure we have the most up-to-date name from live metadata
+                p_name = raw.get("displayName", configs[i].pipeline_name if i < len(configs) else "Unknown")
+                
+                # 1. Generate the Deployment Template (<PipelineDisplayName>.json) from LIVE data
+                ui_content = self._construct_ui_deployment_template(p_name, raw)
+                
+                # 2. Generate manifest.json from LIVE metadata
+                manifest = self._construct_ui_manifest(p_name, raw)
+                
+                # Prefix for bulk export
+                prefix = f"{p_name}/" if len(raw_definitions) > 1 else ""
+                
+                zf.writestr(f"{prefix}{p_name}.json", json.dumps(ui_content, indent=2))
+                zf.writestr(f"{prefix}manifest.json", json.dumps(manifest, indent=2))
 
         return zip_path
 
-    def _inline_dependencies(self, raw: Dict) -> Dict:
-        """Recursively replaces dependency references with full definitions"""
+    def _construct_ui_deployment_template(self, p_name: str, raw: Dict) -> Dict:
+        """
+        Constructs the ARM template using the FULL live pipeline properties verbatim.
+        """
+        import base64
+        properties = {}
         
-        # Step 1: Extract the actual pipeline content from the Fabric response
-        content = {}
+        # Extract the exact execution properties from the live definition parts
         if "definition" in raw and "parts" in raw["definition"]:
             for part in raw["definition"]["parts"]:
                 if part.get("path") == "pipeline-content.json":
                     try:
-                        import base64
                         payload = part.get("payload", "")
                         content = json.loads(base64.b64decode(payload).decode('utf-8'))
-                    except:
-                        content = {}
-                    break
-        
-        if not content:
-            content = raw.get("properties", raw)
+                        # Fabric UI Export uses the 'properties' block directly
+                        properties = content.get("properties", content)
+                        break
+                    except Exception as e:
+                        logger.error(f"Failed to extract live properties: {e}")
 
-        # Step 2: Recursive process to inline services
-        def process(obj):
-            if isinstance(obj, dict):
-                # Deep Resolution for Linked Services
-                # We look for ANY property that mentions a linked service
-                ls_keys = ["linkedServiceName", "connection", "linkedService"]
-                for k in ls_keys:
-                    if k in obj:
-                        val = obj[k]
-                        name = val.get("referenceName") if isinstance(val, dict) else val
-                        if name and isinstance(name, str):
-                            # INLINE the full definition
-                            obj["linkedService"] = {
-                                "name": name,
-                                "properties": {
-                                    "type": "DataWarehouse" if "warehouse" in name.lower() else "Lakehouse",
-                                    "typeProperties": {
-                                        "endpoint": f"{name}.datawarehouse.fabric.microsoft.com",
-                                        "artifactId": str(uuid.uuid4()),
-                                        "workspaceId": str(uuid.uuid4())
-                                    }
-                                }
-                            }
-
-                # Deep Resolution for Datasets
-                if "dataset" in obj and isinstance(obj["dataset"], dict):
-                    ds_name = obj["dataset"].get("referenceName")
-                    if ds_name:
-                        obj["datasetSettings"] = {
-                            "name": ds_name,
-                            "type": "DataWarehouseTable",
-                            "linkedService": { "name": f"LS_{ds_name}" },
-                            "typeProperties": {}
-                        }
-                
-                for key, value in obj.items():
-                    obj[key] = process(value)
-            elif isinstance(obj, list):
-                return [process(item) for item in obj]
-            return obj
-
-        final_content = process(content)
-        # Wrap back into the properties structure if needed
-        if "properties" not in final_content:
-            return {"properties": final_content}
-        return final_content
-
-    def _construct_schedules(self, raw: Dict) -> Dict:
-        """Extracts real schedule from Fabric parts or constructs a valid placeholder"""
-        
-        # Try to find existing schedule part in the Fabric definition
-        if "definition" in raw and "parts" in raw["definition"]:
-            for part in raw["definition"]["parts"]:
-                if part.get("path") == ".schedules":
-                    try:
-                        import base64
-                        payload = part.get("payload", "")
-                        return json.loads(base64.b64decode(payload).decode('utf-8'))
-                    except:
-                        pass
-        
-        # Fallback to a structured placeholder if no schedule is found
-        return {
-            "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/schedules/1.0.0/schema.json",
-            "schedules": [
+        # Final ARM Template Structure
+        template = {
+            "$schema": "http://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+            "contentVersion": "1.0.0.0",
+            "parameters": self._extract_template_parameters(properties),
+            "variables": {},
+            "resources": [
                 {
-                    "enabled": True,
-                    "jobType": "Execute",
-                    "configuration": {
-                        "type": "Daily",
-                        "startDateTime": datetime.utcnow().isoformat(),
-                        "endDateTime": "2099-12-31T23:59:59",
-                        "localTimeZoneId": "UTC",
-                        "times": ["00:00"]
-                    }
+                    "name": p_name,
+                    "type": "pipelines",
+                    "apiVersion": "2018-06-01",
+                    "properties": properties, # COPY VERBATIM FROM LIVE DEFINITION
+                    "dependsOn": []
                 }
             ]
         }
+        return template
+
+    def _extract_template_parameters(self, properties: Dict) -> Dict:
+        """Extracts parameters verbatim from the properties block."""
+        params = {}
+        source_params = properties.get("parameters", {})
+        if isinstance(source_params, dict):
+            for k, v in source_params.items():
+                if isinstance(v, dict):
+                    params[k] = { "type": v.get("type", "string") }
+        return params
+
+    def _construct_ui_manifest(self, p_name: str, raw: Dict) -> Dict:
+        """
+        Constructs manifest.json by extracting metadata directly from the live platform part.
+        """
+        import base64
+        logical_id = "00000000-0000-0000-0000-000000000000"
+        
+        if "definition" in raw and "parts" in raw["definition"]:
+            for part in raw["definition"]["parts"]:
+                if part.get("path") == ".platform":
+                    try:
+                        payload = base64.b64decode(part.get("payload", "")).decode('utf-8')
+                        platform_json = json.loads(payload)
+                        logical_id = platform_json.get("config", {}).get("logicalId", logical_id)
+                        break
+                    except Exception:
+                        pass
+
+        return {
+            "displayName": p_name,
+            "description": "",
+            "type": "DataPipeline",
+            "logicalId": logical_id,
+            "version": "1.0"
+        }
+
+
 
     def _extract_dependencies(self, raw: Dict) -> Dict:
         """Step 2: Recursive dependency extraction"""
