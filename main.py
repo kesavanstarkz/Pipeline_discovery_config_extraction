@@ -152,12 +152,12 @@ class FabricClient:
 
     async def export_pipeline(self, workspace_id: str, pipeline_id: str) -> Dict:
         """
-        Uses Fabric's export API to get the full pipeline definition
-        including all activities, linked services, datasets
+        Uses Fabric's generic Item API to get the full export-ready definition.
+        Format 'Fabric' ensures parameter references are preserved.
         """
         return await self.post(
-            f"{FABRIC_API_BASE}/workspaces/{workspace_id}/dataPipelines/{pipeline_id}/getDefinition",
-            {}
+            f"{FABRIC_API_BASE}/workspaces/{workspace_id}/items/{pipeline_id}/getDefinition",
+            {"format": "Fabric"}
         )
 
     async def get_workspace_info(self, workspace_id: str) -> Dict:
@@ -846,28 +846,59 @@ async def export_pipeline(req: ExportRequest):
     # 3. Use metadata for the pipeline name
     pipeline_name = pipe_meta.get("displayName") or pipe_meta.get("name") or "Unknown"
 
-    # Explicitly extract the verbatim pipeline definition part (pipeline-content.json)
+    # 2. Extract verbatim parts (Pipeline Definition, Manifest, and SVG)
     import base64
-    pipeline_json = {}
+    parts_map = {}
+    exported_svg = ""
+    manifest_obj = {}
+
     if "definition" in pipe_def and "parts" in pipe_def["definition"]:
         for part in pipe_def["definition"]["parts"]:
-            if part.get("path") == "pipeline-content.json":
-                try:
-                    payload = part.get("payload", "")
-                    pipeline_json = json.loads(base64.b64decode(payload).decode('utf-8'))
-                    break
-                except Exception as e:
-                    logger.error(f"Failed to decode pipeline-content.json payload: {e}")
+            path = part.get("path", "")
+            try:
+                payload_raw = part.get("payload", "")
+                payload = base64.b64decode(payload_raw).decode('utf-8')
+                parts_map[path] = payload
+                
+                # Capture SVG if found in any part
+                if path.lower().endswith(".svg") or "image" in path.lower():
+                    exported_svg = payload
+                
+                # Capture Manifest if found
+                if path == "manifest.json":
+                    try:
+                        manifest_obj = json.loads(payload)
+                    except:
+                        pass
+            except:
+                continue
+
+    # Identify core pipeline file
+    # Fabric items usually have a main content file. For pipelines it's pipeline-content.json
+    pipeline_json_str = parts_map.get("pipeline-content.json", "{}")
+    pipeline_json = json.loads(pipeline_json_str)
 
     # 3. Use metadata for the pipeline name
     pipeline_name = pipe_meta.get("displayName") or pipe_meta.get("name") or "Unknown"
 
-    # 4. Construct the Full ARM Deployment Template (api_ingestion.json)
+    # 4. Auto-detect all [parameters('...')] references (Aggressive Search)
+    import re
+    # Matches [parameters('name')], [ parameters( "name" ) ], etc.
+    param_pattern = r"\[\s*parameters\s*\(\s*['\"]([^'\"]+)['\"]\s*\)\s*\]"
+    detected_params = re.findall(param_pattern, pipeline_json_str)
+    
+    # Initialize parameters block
+    final_parameters = pipeline_json.get("parameters", {})
+    for p_name in set(detected_params):
+        if p_name not in final_parameters:
+            final_parameters[p_name] = {"type": "string"}
+
+    # 5. Construct the Full ARM Deployment Template (api_ingestion.json)
     # This matches the native Fabric Home -> Export behavior
     arm_template = {
         "$schema": "http://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
         "contentVersion": "1.0.0.0",
-        "parameters": pipeline_json.get("parameters", {}),
+        "parameters": final_parameters,
         "variables": pipeline_json.get("variables", {}),
         "resources": [
             {
@@ -880,15 +911,20 @@ async def export_pipeline(req: ExportRequest):
         ]
     }
 
-    # 5. Explicitly construct manifest.json
-    manifest = {
-        "displayName": pipeline_name,
-        "type": "DataPipeline",
-        "workspaceId": req.workspace_id,
-        "itemId": req.pipeline_id
-    }
+    # 6. Explicitly construct/preserve manifest.json
+    if not manifest_obj:
+        manifest_obj = {
+            "name": pipeline_name,
+            "image": exported_svg or "" 
+        }
+    else:
+        # Prioritize the image we found in parts if manifest.json was incomplete
+        if not manifest_obj.get("image") and exported_svg:
+            manifest_obj["image"] = exported_svg
+        if "name" not in manifest_obj:
+            manifest_obj["name"] = pipeline_name
 
-    # 6. Write files to disk as requested
+    # 7. Write files to disk as requested
     try:
         with open("api_ingestion.json", "w", encoding="utf-8") as f:
             json.dump(arm_template, f, indent=2)
@@ -903,7 +939,7 @@ async def export_pipeline(req: ExportRequest):
     zip_path = os.path.join(tmp_dir, f"{pipeline_name}_export.zip")
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("api_ingestion.json", json.dumps(arm_template, indent=2))
-        zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+        zf.writestr("manifest.json", json.dumps(manifest_obj, indent=2))
 
     return FileResponse(
         zip_path,
