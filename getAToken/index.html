@@ -1,0 +1,936 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fabric Pipeline Discovery Agent</title>
+  <script src="msal-browser.min.js"></script>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --surface: #f8f9fa;
+      --surface2: #e9ecef;
+      --border: #dee2e6;
+      --border2: #ced4da;
+      --accent: #0d6efd;
+      --accent2: #0b5ed7;
+      --accent3: #0d6efd;
+      --green: #198754;
+      --orange: #fd7e14;
+      --red: #dc3545;
+      --purple: #6f42c1;
+      --text: #212529;
+      --text2: #495057;
+      --text3: #6c757d;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 0;
+      line-height: 1.5;
+    }
+
+    .shell { display: flex; flex-direction: column; min-height: 100vh; }
+
+    header {
+      background-color: #f8f9fa;
+      padding: 0.75rem 2rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .logo { display: flex; align-items: center; gap: 1rem; }
+    .logo-icon {
+      width: 40px;
+      height: 40px;
+      background-color: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: bold;
+      color: var(--accent);
+    }
+    .logo-text { font-size: 1.125rem; font-weight: bold; color: #333; line-height: 1.2; }
+    .logo-sub { font-size: 0.75rem; color: #6c757d; text-transform: uppercase; letter-spacing: 0.05em; }
+
+    main {
+      padding: 2rem;
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+
+    .config-panel, .login-card, .stat-card, .pipeline-card {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+    }
+
+    .section-title {
+      font-size: 0.75rem;
+      font-weight: bold;
+      color: #adb5bd;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 1rem;
+    }
+
+    .config-grid {
+      display: flex;
+      gap: 1rem;
+      align-items: flex-end;
+      flex-wrap: wrap;
+    }
+
+    .field { display: flex; flex-direction: column; gap: 0.25rem; }
+    .field label { font-size: 0.875rem; font-weight: 500; color: #495057; }
+    .field input, .field select, textarea {
+      padding: 0.5rem 0.75rem;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font-size: 0.875rem;
+    }
+
+    .btn {
+      padding: 0.5rem 1rem;
+      font-size: 0.875rem;
+      font-weight: 500;
+      border-radius: 4px;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: #fff;
+      transition: all 0.2s;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .btn:hover { background: #f8f9fa; border-color: #adb5bd; }
+    .btn-primary { background: #007bff; color: #fff; border-color: #007bff; }
+    .btn-primary:hover { background: #0069d9; }
+    .btn-green { background: #28a745; color: #fff; border-color: #28a745; }
+    .btn-green:hover { background: #218838; }
+    .btn-secondary { background: #f8f9fa; }
+
+    .stats-bar {
+      display: flex;
+      gap: 1rem;
+      margin-bottom: 2rem;
+      flex-wrap: wrap;
+    }
+    .stat-card {
+      flex: 1;
+      min-width: 150px;
+      padding: 1rem;
+      text-align: center;
+      margin-bottom: 0;
+    }
+    .stat-label { font-size: 0.75rem; color: #6c757d; font-weight: bold; }
+    .stat-value { font-size: 1.5rem; font-weight: bold; margin: 0.25rem 0; }
+    .stat-sub { font-size: 0.75rem; color: #adb5bd; }
+
+    .tabs {
+      display: flex;
+      gap: 0.25rem;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 1.5rem;
+    }
+    .tab {
+      padding: 0.5rem 1rem;
+      cursor: pointer;
+      border: 1px solid transparent;
+      border-bottom: none;
+      border-radius: 4px 4px 0 0;
+      font-size: 0.875rem;
+      color: #6c757d;
+    }
+    .tab.active {
+      background: #fff;
+      border-color: var(--border);
+      color: #007bff;
+      font-weight: bold;
+      margin-bottom: -1px;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 0.25rem 0.5rem;
+      font-size: 0.75rem;
+      border-radius: 4px;
+      font-weight: 500;
+      border: 1px solid transparent;
+    }
+    .badge-green { background: #d4edda; color: #155724; border-color: #c3e6cb; }
+    .badge-blue { background: #cce5ff; color: #004085; border-color: #b8daff; }
+    .badge-orange { background: #fff3cd; color: #856404; border-color: #ffeeba; }
+    .badge-red { background: #f8d7da; color: #721c24; border-color: #f5c2c7; }
+    .badge-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; margin-right: 6px; }
+
+    .pipeline-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      cursor: pointer;
+    }
+    .pipeline-name { font-weight: bold; font-size: 1rem; color: #333; }
+    .pipeline-id { font-size: 0.75rem; color: #6c757d; font-family: monospace; }
+    .pipeline-meta { display: flex; gap: 0.5rem; margin-top: 0.5rem; flex-wrap: wrap; }
+    .pipeline-actions { display: flex; gap: 0.5rem; }
+    
+    .pipeline-body {
+      display: none;
+      padding-top: 1rem;
+      margin-top: 1rem;
+      border-top: 1px solid #eee;
+    }
+    .pipeline-body.open { display: block; }
+
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 1.5rem;
+    }
+    .detail-section { background: #f8f9fa; padding: 1rem; border-radius: 4px; border: 1px solid #eee; }
+    .detail-section-title { font-size: 0.75rem; font-weight: bold; color: #495057; margin-bottom: 0.75rem; border-bottom: 1px solid #dee2e6; padding-bottom: 0.25rem; }
+    .detail-row { display: flex; justify-content: space-between; font-size: 0.875rem; padding: 0.25rem 0; border-bottom: 1px dotted #dee2e6; }
+    .detail-key { color: #6c757d; }
+    .detail-val { font-weight: 500; word-break: break-all; text-align: right; }
+
+    .schema-table { width: 100%; border-collapse: collapse; font-size: 0.875rem; margin-top: 1rem; }
+    .schema-table th, .schema-table td { border: 1px solid #dee2e6; padding: 0.5rem; text-align: left; }
+    .schema-table th { background: #f1f3f5; font-weight: 600; }
+
+    .chevron { transition: transform 0.2s; display: inline-block; color: #adb5bd; }
+    .chevron.open { transform: rotate(90deg); }
+    .pipeline-icon { font-size: 1.25rem; margin-right: 1rem; }
+
+    .toast {
+      position: fixed;
+      bottom: 2rem;
+      right: 2rem;
+      background: #343a40;
+      color: #fff;
+      padding: 0.75rem 1.25rem;
+      border-radius: 4px;
+      box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+      z-index: 1000;
+      font-size: 0.875rem;
+    }
+
+    .loading-bar {
+      height: 4px;
+      background: #007bff;
+      margin-bottom: 1.5rem;
+      position: relative;
+      overflow: hidden;
+    }
+    .loading-bar::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      height: 100%;
+      background: #cce5ff;
+      animation: loading 2s infinite ease-in-out;
+    }
+    @keyframes loading {
+      0% { left: -40%; width: 40%; }
+      100% { left: 100%; width: 40%; }
+    }
+    
+    .code-block {
+      background: #f8f9fa;
+      border: 1px solid #dee2e6;
+      padding: 1rem;
+      font-family: monospace;
+      font-size: 0.8125rem;
+      overflow: auto;
+      white-space: pre;
+      max-height: 500px;
+    }
+
+    .login-card { max-width: 450px; margin: 5rem auto; text-align: center; }
+    .login-icon { font-size: 3rem; margin-bottom: 1rem; }
+    .login-title { margin-bottom: 0.5rem; }
+    .login-sub { color: #6c757d; margin-bottom: 2rem; }
+    .login-features { text-align: left; margin-bottom: 2rem; }
+    .login-feature { display: flex; gap: 1rem; margin-bottom: 1rem; align-items: flex-start; }
+    .feat-icon { font-size: 1.25rem; }
+    .feat-label { font-weight: bold; display: block; font-size: 0.875rem; }
+    .feat-desc { font-size: 0.8125rem; color: #6c757d; }
+    .btn-login { width: 100%; padding: 0.75rem; font-size: 1rem; justify-content: center; }
+
+    .empty-state { text-align: center; padding: 3rem; color: #adb5bd; border: 2px dashed #e9ecef; border-radius: 4px; }
+    .empty-state .icon { font-size: 2rem; margin-bottom: 1rem; }
+  </style>
+</head>
+
+<body>
+  <div class="shell">
+
+    <!-- Header -->
+    <header>
+      <div class="logo">
+        <div class="logo-icon">FDA</div>
+        <div>
+          <div class="logo-text">Fabric Discovery Agent</div>
+          <div class="logo-sub">Pipeline Config Extractor</div>
+        </div>
+      </div>
+      <div class="header-right">
+        <div id="auth-status" class="badge badge-orange"><span class="badge-dot"></span>Not Connected</div>
+        <button id="btn-logout" class="btn btn-secondary" style="display:none" onclick="logout()">Sign Out</button>
+      </div>
+    </header>
+
+    <main>
+
+      <!-- Login Screen -->
+      <div id="login-screen">
+        <div class="login-card">
+          <h1 class="login-title">Connect to Microsoft Fabric</h1>
+          <p class="login-sub">Sign in with your Azure account to auto-discover pipeline configurations and export them
+            as portable packages.</p>
+
+          <div class="login-features">
+            <div class="login-feature">
+              <div>
+                <div class="feat-label">Ingestion Type Detection</div>
+                <div class="feat-desc">Auto-identifies API, S3, SFTP, EventHub, SQL sources</div>
+              </div>
+            </div>
+            <div class="login-feature">
+              <div>
+                <div class="feat-label">File Structure Discovery</div>
+                <div class="feat-desc">Extracts columns, data types, relationships, constraints</div>
+              </div>
+            </div>
+            <div class="login-feature">
+              <div>
+                <div class="feat-label">One-Click Export</div>
+                <div class="feat-desc">Export pipeline + schema as importable ZIP — share with anyone</div>
+              </div>
+            </div>
+          </div>
+
+          <button class="btn btn-login" onclick="signIn()">
+            <svg width="18" height="18" viewBox="0 0 23 23" fill="none" style="flex-shrink:0">
+              <path d="M1 1h10v10H1z" fill="#f25022" />
+              <path d="M12 1h10v10H12z" fill="#7fba00" />
+              <path d="M1 12h10v10H1z" fill="#00a4ef" />
+              <path d="M12 12h10v10H12z" fill="#ffb900" />
+            </svg>
+            Sign in with Microsoft
+          </button>
+        </div>
+      </div>
+
+      <!-- App Screen -->
+      <div id="app-screen">
+
+        <!-- Config Panel -->
+        <div class="config-panel">
+          <div class="section-title">Configuration</div>
+          <div class="config-grid">
+            <div class="field">
+              <label>API Endpoint</label>
+              <input id="api-url" type="text" value="http://localhost:8000" placeholder="http://localhost:8000">
+            </div>
+            <div class="field">
+              <label>Workspace ID</label>
+              <input id="workspace-id" type="text" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+            </div>
+            <button class="btn btn-secondary" onclick="loadWorkspaces()">List Workspaces</button>
+            <button class="btn btn-primary" onclick="runDiscovery()" id="btn-discover">
+              Discover Pipelines
+            </button>
+          </div>
+          <div style="margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap;" id="workspace-chips"></div>
+        </div>
+
+        <!-- Stats -->
+        <div class="stats-bar">
+          <div class="stat-card">
+            <div class="stat-label">Pipelines Found</div>
+            <div class="stat-value" id="stat-total">—</div>
+            <div class="stat-sub">in workspace</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Ingestion Types</div>
+            <div class="stat-value" id="stat-types">—</div>
+            <div class="stat-sub">detected</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">File Types</div>
+            <div class="stat-value" id="stat-ftypes">—</div>
+            <div class="stat-sub">across all pipelines</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Errors</div>
+            <div class="stat-value" id="stat-errors" style="color:var(--red)">—</div>
+            <div class="stat-sub">analysis failures</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Status</div>
+            <div id="stat-status" class="stat-value" style="font-size:14px;color:var(--text3);padding-top:8px">Idle
+            </div>
+            <div class="stat-sub" id="stat-time">—</div>
+          </div>
+        </div>
+
+        <!-- Loading Bar -->
+        <div id="loading-bar" class="loading-bar" style="display:none"></div>
+
+        <!-- Tabs -->
+        <div class="tabs">
+          <div class="tab active" onclick="switchTab('pipelines', this)">Pipelines</div>
+          <div class="tab" onclick="switchTab('export', this)">Export</div>
+          <div class="tab" onclick="switchTab('raw', this)">Raw JSON</div>
+        </div>
+
+        <!-- Pipelines Tab -->
+        <div class="tab-content active" id="tab-pipelines">
+          <div id="pipeline-actions" style="display:flex; gap:8px; margin-bottom:16px; display:none">
+            <button class="btn btn-green" onclick="exportAll()">Export All as ZIP</button>
+            <button class="btn btn-secondary" onclick="copyAllJSON()">Copy All JSON</button>
+          </div>
+          <div id="pipelines-list">
+            <div class="empty-state">
+              <div class="msg">Run discovery to find pipelines in your Fabric workspace</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Export Tab -->
+        <div class="tab-content" id="tab-export">
+          <div class="config-panel">
+            <div class="section-title">Export Single Pipeline</div>
+            <div class="config-grid">
+              <div class="field">
+                <label>Pipeline ID</label>
+                <input id="export-pipeline-id" type="text" placeholder="Select from discovery results or paste ID">
+              </div>
+              <div class="field">
+                <label>Workspace ID</label>
+                <input id="export-workspace-id" type="text" placeholder="same as above">
+              </div>
+              <button class="btn btn-green" onclick="exportSingle()">Export ZIP</button>
+              <button class="btn btn-secondary" onclick="exportAll()">Export All</button>
+            </div>
+          </div>
+
+          <div class="config-panel" style="margin-top: 16px;">
+            <div class="section-title">Offline Analysis — Paste Pipeline JSON</div>
+            <textarea id="paste-json"
+              style="width:100%; height:200px; background:var(--surface2); border:1px solid var(--border2); border-radius:8px; padding:12px; color:var(--text); font-family:var(--mono); font-size:12px; outline:none; resize:vertical;"
+              placeholder='Paste your pipeline_definition.json here...'></textarea>
+            <div style="margin-top:12px">
+              <button class="btn btn-primary" onclick="analyzeOffline()">Analyze Offline</button>
+            </div>
+            <div id="offline-result" style="margin-top:16px"></div>
+          </div>
+        </div>
+
+        <!-- Raw JSON Tab -->
+        <div class="tab-content" id="tab-raw">
+          <div id="raw-json-view">
+            <div class="empty-state">
+              <div class="icon">JSON</div>
+              <div class="msg">Raw discovery results will appear here after running discovery</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+
+  <!-- Toast container -->
+  <div id="toast-container"></div>
+
+  <script>
+    // ── MSAL Config ──────────────────────────────────────────────────────────────
+    // Replace with your Azure App Registration values
+    const MSAL_CONFIG = {
+      auth: {
+        clientId: "f7ee975c-b651-4171-ae62-b913122575cb",
+        authority: "https://login.microsoftonline.com/b8869792-ee44-4a05-a4fb-b6323a34ca35",
+        redirectUri: "http://localhost:8001/getAToken"
+      },
+      cache: { cacheLocation: "sessionStorage" }
+    };
+
+    const SCOPES = [
+      "https://api.fabric.microsoft.com/.default"
+    ];
+
+    let msalInstance;
+    let accessToken = null;
+    let discoveryResults = null;
+
+    // ── Init ─────────────────────────────────────────────────────────────────────
+    async function init() {
+      // 1. Try to fetch real config from backend first
+      try {
+        const resp = await fetch(getApiUrl() + "/auth/config").catch(() => null);
+        if (resp && resp.ok) {
+          const cfg = await resp.json();
+          if (cfg.clientId && !cfg.clientId.toLowerCase().includes("your_client_id")) {
+            MSAL_CONFIG.auth.clientId = cfg.clientId;
+            MSAL_CONFIG.auth.authority = cfg.authority;
+            if (cfg.redirectUri) MSAL_CONFIG.auth.redirectUri = cfg.redirectUri;
+          }
+        }
+      } catch (e) {
+        console.warn("Backend config fetch failed, using defaults:", e);
+      }
+
+      // 2. Initialize MSAL
+      try {
+        msalInstance = new msal.PublicClientApplication(MSAL_CONFIG);
+        await msalInstance.initialize();
+
+        // Check for redirect response
+        const response = await msalInstance.handleRedirectPromise();
+        if (response) {
+          accessToken = response.accessToken;
+          onSignedIn(response.account);
+          return;
+        }
+
+        // Check if already signed in
+        const accounts = msalInstance.getAllAccounts();
+        if (accounts.length > 0) {
+          try {
+            const silentReq = { scopes: SCOPES, account: accounts[0] };
+            const result = await msalInstance.acquireTokenSilent(silentReq);
+            accessToken = result.accessToken;
+            onSignedIn(accounts[0]);
+          } catch (e) {
+            // Silent failed, show login
+          }
+        }
+      } catch (e) {
+        console.error("MSAL initialization failed:", e);
+        showToast("⚠️ MSAL failed to initialize. Check Azure credentials.", "orange");
+      }
+    }
+
+    function getApiUrl() {
+      return (document.getElementById("api-url")?.value || "http://localhost:8000").replace(/\/$/, "");
+    }
+
+    async function signIn() {
+      if (!msalInstance) {
+        showToast("Error: MSAL not initialized. Check console.", "red");
+        return;
+      }
+      try {
+        const result = await msalInstance.loginPopup({ scopes: SCOPES });
+        accessToken = result.accessToken;
+        onSignedIn(result.account);
+      } catch (e) {
+        if (!e.errorCode?.includes("user_cancelled")) {
+          showToast("Error: Sign-in failed: " + e.message, "red");
+        }
+      }
+    }
+
+    function onSignedIn(account) {
+      document.getElementById("login-screen").style.display = "none";
+      document.getElementById("app-screen").style.display = "block";
+      document.getElementById("auth-status").innerHTML = `<span class="badge-dot"></span>${account.name || account.username}`;
+      document.getElementById("auth-status").className = "badge badge-green";
+      document.getElementById("btn-logout").style.display = "inline-flex";
+      showToast(`Signed in as ${account.name || account.username}`, "green");
+    }
+
+    async function logout() {
+      if (msalInstance) {
+        await msalInstance.logoutPopup();
+      }
+      accessToken = null;
+      document.getElementById("login-screen").style.display = "flex";
+      document.getElementById("app-screen").style.display = "none";
+      document.getElementById("auth-status").innerHTML = `<span class="badge-dot"></span>Not Connected`;
+      document.getElementById("auth-status").className = "badge badge-orange";
+      document.getElementById("btn-logout").style.display = "none";
+    }
+
+    // ── Token refresh helper ──────────────────────────────────────────────────────
+    async function getToken() {
+      if (!msalInstance) return accessToken; // Demo mode
+      const accounts = msalInstance.getAllAccounts();
+      if (!accounts.length) throw new Error("Not signed in");
+      try {
+        const result = await msalInstance.acquireTokenSilent({ scopes: SCOPES, account: accounts[0] });
+        accessToken = result.accessToken;
+        return accessToken;
+      } catch (e) {
+        const result = await msalInstance.acquireTokenPopup({ scopes: SCOPES, account: accounts[0] });
+        accessToken = result.accessToken;
+        return accessToken;
+      }
+    }
+
+    // ── API Calls ─────────────────────────────────────────────────────────────────
+    async function apiPost(path, body) {
+      const token = await getToken();
+      const resp = await fetch(getApiUrl() + path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...body, access_token: token })
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+        throw new Error(err.detail || resp.statusText);
+      }
+      return resp.json();
+    }
+
+    // ── Workspaces ────────────────────────────────────────────────────────────────
+    async function loadWorkspaces() {
+      showLoading(true);
+      try {
+        const data = await apiPost("/workspaces", {});
+        const chips = document.getElementById("workspace-chips");
+        chips.innerHTML = "";
+        data.workspaces.forEach(ws => {
+          const btn = document.createElement("button");
+          btn.className = "btn btn-secondary";
+          btn.style.fontSize = "12px";
+          btn.style.padding = "5px 10px";
+          btn.innerHTML = ws.displayName;
+          btn.onclick = () => {
+            document.getElementById("workspace-id").value = ws.id;
+            document.getElementById("export-workspace-id").value = ws.id;
+          };
+          chips.appendChild(btn);
+        });
+        showToast(`Found ${data.count} workspaces`, "blue");
+      } catch (e) {
+        showToast("Error: " + e.message, "red");
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    // ── Discovery ─────────────────────────────────────────────────────────────────
+    async function runDiscovery() {
+      const wsId = document.getElementById("workspace-id").value.trim();
+      if (!wsId) { showToast("Error: Enter a Workspace ID", "orange"); return; }
+
+      showLoading(true);
+      document.getElementById("stat-status").textContent = "Discovering...";
+      document.getElementById("stat-status").style.color = "var(--accent3)";
+      const t0 = Date.now();
+
+      try {
+        const data = await apiPost("/discover", { workspace_id: wsId });
+        discoveryResults = data;
+
+        // Update stats
+        document.getElementById("stat-total").textContent = data.discovered;
+        document.getElementById("stat-errors").textContent = data.errors;
+
+        const itypes = new Set(data.configs.map(c => c.ingestion_metadata?.ingestion_type).filter(Boolean));
+        document.getElementById("stat-types").textContent = itypes.size;
+
+        const ftypes = new Set(data.configs.flatMap(c => c.file_structures?.map(fs => fs.file_type) || []));
+        document.getElementById("stat-ftypes").textContent = ftypes.size;
+
+        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+        document.getElementById("stat-status").textContent = "Complete";
+        document.getElementById("stat-status").style.color = "var(--green)";
+        document.getElementById("stat-time").textContent = `in ${elapsed}s`;
+
+        renderPipelines(data.configs);
+        renderRawJSON(data);
+
+        document.getElementById("export-workspace-id").value = wsId;
+        document.getElementById("pipeline-actions").style.display = "flex";
+
+        showToast(`Discovered ${data.discovered} pipelines (${elapsed}s)`, "green");
+      } catch (e) {
+        document.getElementById("stat-status").textContent = "Error";
+        document.getElementById("stat-status").style.color = "var(--red)";
+        showToast("Error: " + e.message, "red");
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    // ── Render Pipelines ──────────────────────────────────────────────────────────
+    function renderPipelines(configs) {
+      const container = document.getElementById("pipelines-list");
+      if (!configs.length) {
+        container.innerHTML = `<div class="empty-state"><div class="msg">No pipelines found in this workspace</div></div>`;
+        return;
+      }
+
+      container.innerHTML = configs.map((c, i) => renderPipelineCard(c, i)).join("");
+    }
+
+    function renderPipelineCard(c, i) {
+      const ing = c.ingestion_metadata || {};
+      const fstructs = c.file_structures || [];
+      const ftypes = fstructs.map(f => f.file_type).join(", ");
+      const ingColor = { API: "blue", S3: "green", SFTP: "orange", EventHub: "purple", SQL: "blue" }[ing.ingestion_type] || "blue";
+      const loadColor = { Delta: "green", Merge: "blue", Truncate: "orange" }[ing.load_type] || "blue";
+
+      const schemaRows = fstructs.flatMap(fs =>
+        (fs.columns || []).map(col =>
+          `<tr>
+        <td class="col-name">${col.name}</td>
+        <td>${col.data_type}</td>
+        <td>${col.is_mandatory ? '✓' : '—'}</td>
+        <td>${col.format || '—'}</td>
+        <td>${col.order}</td>
+        <td>${col.max_length || '—'}</td>
+        <td>${fs.file_type}</td>
+      </tr>`
+        )
+      ).join("");
+
+      return `
+  <div class="pipeline-card">
+    <div class="pipeline-header" onclick="toggleCard(${i})">
+      <div class="pipeline-icon">🔧</div>
+      <div style="flex:1; min-width:0">
+        <div class="pipeline-name">${c.pipeline_name}</div>
+        <div class="pipeline-id">${c.pipeline_id}</div>
+        <div class="pipeline-meta">
+          <span class="badge badge-${ingColor}">${ing.ingestion_type || 'Unknown'}</span>
+          ${ing.trigger_type ? `<span class="badge badge-blue">${ing.trigger_type}</span>` : ''}
+          ${ing.load_type ? `<span class="badge badge-${loadColor}">${ing.load_type}</span>` : ''}
+          ${ftypes ? `<span class="badge badge-orange">${ftypes}</span>` : ''}
+        </div>
+      </div>
+      <div class="pipeline-actions" onclick="event.stopPropagation()">
+        <button class="btn btn-secondary" style="font-size:12px;padding:5px 10px" onclick="selectForExport('${c.pipeline_id}')">Export</button>
+        <button class="btn btn-secondary" style="font-size:12px;padding:5px 10px" onclick="copyJSON(${i})">JSON</button>
+      </div>
+      <span class="chevron" id="chevron-${i}">></span>
+    </div>
+
+    <div class="pipeline-body" id="body-${i}">
+      <div class="detail-grid">
+        <!-- Ingestion -->
+        <div class="detail-section">
+          <div class="detail-section-title">Ingestion Metadata</div>
+          ${detailRow("Source", ing.source)}
+          ${detailRow("Ingestion Type", ing.ingestion_type)}
+          ${detailRow("Trigger", ing.trigger_type)}
+          ${detailRow("Schedule", ing.ingestion_frequency)}
+          ${detailRow("Load Type", ing.load_type)}
+          ${detailRow("File Pattern", ing.file_name_pattern)}
+          ${detailRow("Process", ing.ingestion_process)}
+        </div>
+
+        <!-- File Types -->
+        <div class="detail-section">
+          <div class="detail-section-title">File Structure Summary</div>
+          ${fstructs.map(fs => `
+            ${detailRow("Type", fs.file_type)}
+            ${detailRow("Columns", (fs.columns || []).length)}
+            ${detailRow("File Size", fs.file_size_bytes ? formatBytes(fs.file_size_bytes) : null)}
+            ${detailRow("Record Count", fs.record_count)}
+            ${detailRow("Nested", fs.nested_structure ? "Yes" : "No")}
+            <hr style="border-color:var(--border); margin: 8px 0">
+          `).join("")}
+        </div>
+
+        <!-- Pipeline Info -->
+        <div class="detail-section">
+          <div class="detail-section-title">Pipeline Info</div>
+          ${detailRow("Workspace", c.workspace_name)}
+          ${detailRow("Discovered", new Date(c.discovered_at).toLocaleString())}
+          ${detailRow("Schema Version", c.schema_version)}
+        </div>
+      </div>
+
+      <!-- Column schema table -->
+      ${schemaRows ? `
+      <div style="margin-top:16px; background:white; border:1px solid var(--border); border-radius:4px; padding:16px;">
+        <div class="detail-section-title">Column Schema</div>
+        <div style="overflow-x:auto">
+          <table class="schema-table">
+            <thead>
+              <tr>
+                <th>Column</th><th>Type</th><th>Mandatory</th><th>Format</th><th>Order</th><th>Max Len</th><th>File Type</th>
+              </tr>
+            </thead>
+            <tbody>${schemaRows}</tbody>
+          </table>
+        </div>
+      </div>` : ""}
+    </div>
+  </div>`;
+    }
+
+    function detailRow(key, val) {
+      if (val == null || val === "" || val === "Unknown") return "";
+      return `<div class="detail-row"><span class="detail-key">${key}</span><span class="detail-val">${val}</span></div>`;
+    }
+
+    function formatBytes(b) {
+      if (b < 1024) return b + " B";
+      if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
+      return (b / 1048576).toFixed(1) + " MB";
+    }
+
+    function toggleCard(i) {
+      const body = document.getElementById(`body-${i}`);
+      const ch = document.getElementById(`chevron-${i}`);
+      body.classList.toggle("open");
+      ch.classList.toggle("open");
+    }
+
+    // ── Export ────────────────────────────────────────────────────────────────────
+    function selectForExport(pipelineId) {
+      document.getElementById("export-pipeline-id").value = pipelineId;
+      switchTab("export", document.querySelector(".tab:nth-child(2)"));
+      showToast("Pipeline selected for export", "blue");
+    }
+
+    async function exportSingle() {
+      const wsId = document.getElementById("export-workspace-id").value.trim();
+      const plId = document.getElementById("export-pipeline-id").value.trim();
+      if (!wsId || !plId) { showToast("Error: Enter workspace and pipeline IDs", "orange"); return; }
+
+      showLoading(true);
+      try {
+        const token = await getToken();
+        const resp = await fetch(getApiUrl() + "/export", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workspace_id: wsId, pipeline_id: plId, access_token: token })
+        });
+        if (!resp.ok) throw new Error((await resp.json()).detail || resp.statusText);
+        const blob = await resp.blob();
+        downloadBlob(blob, `pipeline_export.zip`);
+        showToast("Pipeline exported!", "green");
+      } catch (e) {
+        showToast("Error: " + e.message, "red");
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    async function exportAll() {
+      const wsId = document.getElementById("workspace-id").value.trim() ||
+        document.getElementById("export-workspace-id").value.trim();
+      if (!wsId) { showToast("Error: Enter a Workspace ID first", "orange"); return; }
+
+      showLoading(true);
+      try {
+        const token = await getToken();
+        const resp = await fetch(getApiUrl() + "/export/bulk", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workspace_id: wsId, access_token: token })
+        });
+        if (!resp.ok) throw new Error((await resp.json()).detail || resp.statusText);
+        const blob = await resp.blob();
+        downloadBlob(blob, `fabric_all_pipelines_export.zip`);
+        showToast("All pipelines exported!", "green");
+      } catch (e) {
+        showToast("Error: " + e.message, "red");
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    async function analyzeOffline() {
+      const txt = document.getElementById("paste-json").value.trim();
+      if (!txt) { showToast("Error: Paste a pipeline definition JSON", "orange"); return; }
+      let parsed;
+      try { parsed = JSON.parse(txt); } catch (e) { showToast("❌ Invalid JSON", "red"); return; }
+
+      showLoading(true);
+      try {
+        const resp = await fetch(getApiUrl() + "/analyze/schema", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pipeline_definition: parsed, workspace_name: "Offline" })
+        });
+        if (!resp.ok) throw new Error((await resp.json()).detail);
+        const data = await resp.json();
+        document.getElementById("offline-result").innerHTML =
+          `<div class="code-block">${JSON.stringify(data, null, 2)}</div>`;
+        showToast("Analysis complete", "green");
+      } catch (e) {
+        showToast("Error: " + e.message, "red");
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────────
+    function renderRawJSON(data) {
+      document.getElementById("raw-json-view").innerHTML =
+        `<div class="code-block">${JSON.stringify(data, null, 2)}</div>`;
+    }
+
+    function copyJSON(i) {
+      const c = discoveryResults?.configs?.[i];
+      if (!c) return;
+      navigator.clipboard.writeText(JSON.stringify(c, null, 2));
+      showToast("Copied to clipboard", "blue");
+    }
+
+    function copyAllJSON() {
+      if (!discoveryResults) return;
+      navigator.clipboard.writeText(JSON.stringify(discoveryResults, null, 2));
+      showToast("All JSON copied", "blue");
+    }
+
+    function downloadBlob(blob, name) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = name;
+      document.body.appendChild(a); a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+
+    function showLoading(on) {
+      document.getElementById("loading-bar").style.display = on ? "block" : "none";
+      document.getElementById("btn-discover").disabled = on;
+    }
+
+    function switchTab(name, el) {
+      document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+      document.querySelectorAll(".tab-content").forEach(t => t.classList.remove("active"));
+      el.classList.add("active");
+      document.getElementById("tab-" + name).classList.add("active");
+    }
+
+    function showToast(msg, type = "blue") {
+      const colors = { green: "var(--green)", blue: "var(--accent3)", orange: "var(--orange)", red: "var(--red)" };
+      const t = document.createElement("div");
+      t.className = "toast";
+      t.innerHTML = `<span>${msg}</span>`;
+      const c = document.getElementById("toast-container");
+      c.appendChild(t);
+      setTimeout(() => { t.style.opacity = "0"; t.style.transition = "opacity 0.3s"; setTimeout(() => t.remove(), 300); }, 3500);
+    }
+
+    // ── Bootstrap ─────────────────────────────────────────────────────────────────
+    init();
+  </script>
+</body>
+
+</html>
