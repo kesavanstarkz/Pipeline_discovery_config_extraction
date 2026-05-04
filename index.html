@@ -542,6 +542,7 @@
           btn.onclick = () => {
             document.getElementById("workspace-id").value = ws.id;
             document.getElementById("export-workspace-id").value = ws.id;
+            document.getElementById("export-pipeline-id").value = ""; // Clear stale ID
           };
           chips.appendChild(btn);
         });
@@ -586,6 +587,7 @@
         renderRawJSON(data);
 
         document.getElementById("export-workspace-id").value = wsId;
+        document.getElementById("export-pipeline-id").value = ""; // Clear stale ID on new discovery
         document.getElementById("pipeline-actions").style.display = "flex";
 
         showToast(`Discovered ${data.discovered} pipelines (${elapsed}s)`, "green");
@@ -645,7 +647,7 @@
         </div>
       </div>
       <div class="pipeline-actions" onclick="event.stopPropagation()">
-        <button class="btn btn-green" style="font-size:12px;padding:5px 10px" onclick="downloadPipelineZip('${c.workspace_id || document.getElementById('workspace-id').value}', '${c.pipeline_id}', '${c.pipeline_name}')">Export ZIP</button>
+        <button class="btn btn-green" style="font-size:12px;padding:5px 10px" onclick="exportSingle('${c.pipeline_id}', '${c.pipeline_name}')">Export ZIP</button>
         <button class="btn btn-secondary" style="font-size:12px;padding:5px 10px" onclick="copyJSON(${i})">JSON</button>
       </div>
       <span class="chevron" id="chevron-${i}">></span>
@@ -725,8 +727,14 @@
     }
 
     // ── Export ────────────────────────────────────────────────────────────────────
-    async function downloadPipelineZip(wsId, plId, name) {
+    async function exportSingle(pipelineId, name) {
+      // Use passed ID or read from input if missing
+      const plId = pipelineId || document.getElementById("export-pipeline-id").value.trim();
+      const wsId = document.getElementById("export-workspace-id").value.trim() || document.getElementById("workspace-id").value.trim();
+      
       if (!wsId || !plId) { showToast("Error: Missing workspace or pipeline ID", "orange"); return; }
+      
+      console.log("Exporting pipeline:", plId, "Name:", name);
       showLoading(true);
       try {
         const token = await getToken();
@@ -737,38 +745,8 @@
         });
         if (!resp.ok) throw new Error((await resp.json()).detail || resp.statusText);
         const blob = await resp.blob();
-        downloadBlob(blob, `${name || 'pipeline'}_export.zip`);
-        showToast(`Exported ${name}`, "green");
-      } catch (e) {
-        showToast("Error: " + e.message, "red");
-      } finally {
-        showLoading(false);
-      }
-    }
-
-    function selectForExport(pipelineId) {
-      document.getElementById("export-pipeline-id").value = pipelineId;
-      switchTab("export", document.querySelector(".tab:nth-child(2)"));
-      showToast("Pipeline selected for export", "blue");
-    }
-
-    async function exportSingle() {
-      const wsId = document.getElementById("export-workspace-id").value.trim();
-      const plId = document.getElementById("export-pipeline-id").value.trim();
-      if (!wsId || !plId) { showToast("Error: Enter workspace and pipeline IDs", "orange"); return; }
-
-      showLoading(true);
-      try {
-        const token = await getToken();
-        const resp = await fetch(getApiUrl() + "/export", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ workspace_id: wsId, pipeline_id: plId, access_token: token })
-        });
-        if (!resp.ok) throw new Error((await resp.json()).detail || resp.statusText);
-        const blob = await resp.blob();
-        downloadBlob(blob, `${plId}_export.zip`);
-        showToast("Pipeline exported!", "green");
+        downloadBlob(blob, `${name || plId}_export.zip`);
+        showToast(`Exported ${name || plId}`, "green");
       } catch (e) {
         showToast("Error: " + e.message, "red");
       } finally {

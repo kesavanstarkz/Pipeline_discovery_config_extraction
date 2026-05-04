@@ -130,6 +130,10 @@ class FabricClient:
     async def post(self, url: str, body: Dict) -> Dict:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(url, headers=self.headers, json=body)
+            if resp.status_code == 401:
+                raise HTTPException(status_code=401, detail="Token expired or invalid. Please re-authenticate.")
+            if resp.status_code == 403:
+                raise HTTPException(status_code=403, detail="Insufficient scopes. Export requires 'DataPipeline.ReadWrite.All' or 'Item.ReadWrite.All'.")
             resp.raise_for_status()
             return resp.json()
 
@@ -406,11 +410,11 @@ class DiscoveryEngine:
             steps.append(f"{name} ({act_type})")
         return steps if steps else ["Not Available"]
 
-    def analyze_pipeline(self, pipeline_def: Dict, workspace_name: str) -> PipelineConfig:
+    def analyze_pipeline(self, pipeline_def: Dict, workspace_name: str, p_name: str = None, p_id: str = None) -> PipelineConfig:
         actual_content = self._extract_decoded_content(pipeline_def)
         props = pipeline_def.get("properties", pipeline_def)
-        pipeline_id = pipeline_def.get("id", str(uuid.uuid4()))
-        pipeline_name = pipeline_def.get("displayName", pipeline_def.get("name", "Unknown"))
+        pipeline_id = p_id or pipeline_def.get("id", str(uuid.uuid4()))
+        pipeline_name = p_name or pipeline_def.get("displayName", pipeline_def.get("name", "Unknown"))
         workspace_id = pipeline_def.get("workspaceId", "")
 
         ingestion_type = self.detect_ingestion_type(actual_content)
@@ -479,24 +483,26 @@ class ExportEngine:
         return obj
 
     def create_deep_export(
-        self, configs: List[PipelineConfig], raw_definitions: List[Dict]
+        self, metadata_list: List[Dict], raw_definitions: List[Dict]
     ) -> str:
         """
         Builds a Fabric UI Export format package using live definition data.
+        - API Ingestion.json: Full pipeline JSON from getDefinition
+        - manifest.json: Metadata from get_pipeline
         """
         tmp_dir = tempfile.mkdtemp()
         zip_path = os.path.join(tmp_dir, f"fabric_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
 
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for i, raw in enumerate(raw_definitions):
-                # Ensure we have the most up-to-date name from live metadata
-                p_name = raw.get("displayName", configs[i].pipeline_name if i < len(configs) else "Unknown")
+                meta = metadata_list[i] if i < len(metadata_list) else {}
+                p_name = meta.get("displayName", "Unknown")
                 
-                # 1. Generate the Deployment Template (<PipelineDisplayName>.json) from LIVE data
-                ui_content = self._construct_ui_deployment_template(p_name, raw)
+                # 1. Generate the Full Pipeline JSON (<PipelineDisplayName>.json)
+                ui_content = self._construct_ui_deployment_template(raw)
                 
                 # 2. Generate manifest.json from LIVE metadata
-                manifest = self._construct_ui_manifest(p_name, raw)
+                manifest = self._construct_ui_manifest(meta, raw)
                 
                 # Prefix for bulk export
                 prefix = f"{p_name}/" if len(raw_definitions) > 1 else ""
@@ -506,63 +512,32 @@ class ExportEngine:
 
         return zip_path
 
-    def _construct_ui_deployment_template(self, p_name: str, raw: Dict) -> Dict:
+    def _construct_ui_deployment_template(self, raw_definition: Dict) -> Dict:
         """
-        Constructs the ARM template using the FULL live pipeline properties verbatim.
+        Extracts the full pipeline JSON exactly as returned in getDefinition.
         """
         import base64
-        properties = {}
-        
-        # Extract the exact execution properties from the live definition parts
-        if "definition" in raw and "parts" in raw["definition"]:
-            for part in raw["definition"]["parts"]:
+        if "definition" in raw_definition and "parts" in raw_definition["definition"]:
+            for part in raw_definition["definition"]["parts"]:
                 if part.get("path") == "pipeline-content.json":
                     try:
                         payload = part.get("payload", "")
-                        content = json.loads(base64.b64decode(payload).decode('utf-8'))
-                        # Fabric UI Export uses the 'properties' block directly
-                        properties = content.get("properties", content)
-                        break
+                        # Save the decoded JSON exactly as returned
+                        return json.loads(base64.b64decode(payload).decode('utf-8'))
                     except Exception as e:
-                        logger.error(f"Failed to extract live properties: {e}")
+                        logger.error(f"Failed to decode pipeline-content.json: {e}")
+        return {}
 
-        # Final ARM Template Structure
-        template = {
-            "$schema": "http://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
-            "contentVersion": "1.0.0.0",
-            "parameters": self._extract_template_parameters(properties),
-            "variables": {},
-            "resources": [
-                {
-                    "name": p_name,
-                    "type": "pipelines",
-                    "apiVersion": "2018-06-01",
-                    "properties": properties, # COPY VERBATIM FROM LIVE DEFINITION
-                    "dependsOn": []
-                }
-            ]
-        }
-        return template
-
-    def _extract_template_parameters(self, properties: Dict) -> Dict:
-        """Extracts parameters verbatim from the properties block."""
-        params = {}
-        source_params = properties.get("parameters", {})
-        if isinstance(source_params, dict):
-            for k, v in source_params.items():
-                if isinstance(v, dict):
-                    params[k] = { "type": v.get("type", "string") }
-        return params
-
-    def _construct_ui_manifest(self, p_name: str, raw: Dict) -> Dict:
+    def _construct_ui_manifest(self, metadata: Dict, raw_definition: Dict) -> Dict:
         """
-        Constructs manifest.json by extracting metadata directly from the live platform part.
+        Constructs manifest.json by extracting metadata directly from the live API responses.
         """
         import base64
         logical_id = "00000000-0000-0000-0000-000000000000"
         
-        if "definition" in raw and "parts" in raw["definition"]:
-            for part in raw["definition"]["parts"]:
+        # Extract logicalId from .platform part if available
+        if "definition" in raw_definition and "parts" in raw_definition["definition"]:
+            for part in raw_definition["definition"]["parts"]:
                 if part.get("path") == ".platform":
                     try:
                         payload = base64.b64decode(part.get("payload", "")).decode('utf-8')
@@ -573,8 +548,8 @@ class ExportEngine:
                         pass
 
         return {
-            "displayName": p_name,
-            "description": "",
+            "displayName": metadata.get("displayName", "Unknown"),
+            "description": metadata.get("description") or "",
             "type": "DataPipeline",
             "logicalId": logical_id,
             "version": "1.0"
@@ -707,7 +682,7 @@ async def serve_ui():
 @app.get("/login")
 async def login():
     """Redirects user to Azure login page"""
-    scope = "https://api.fabric.microsoft.com/.default offline_access"
+    scope = "https://api.fabric.microsoft.com/DataPipeline.ReadWrite.All https://api.fabric.microsoft.com/Item.ReadWrite.All offline_access"
     auth_url = (
         f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/oauth2/v2.0/authorize"
         f"?client_id={AZURE_CLIENT_ID}"
@@ -728,6 +703,7 @@ async def auth_callback(code: str):
         "code": code,
         "grant_type": "authorization_code",
         "redirect_uri": AZURE_REDIRECT_URI,
+        "scope": "https://api.fabric.microsoft.com/DataPipeline.ReadWrite.All https://api.fabric.microsoft.com/Item.ReadWrite.All"
     }
     async with httpx.AsyncClient() as client:
         resp = await client.post(token_url, data=data)
@@ -781,11 +757,20 @@ async def discover_pipelines(req: DiscoveryRequest):
         ws_name = req.workspace_id
 
     # Discover pipelines
+    pipeline_meta_map = {}
     if req.pipeline_ids:
         pipeline_ids = req.pipeline_ids
+        # Fetch names for specific IDs
+        for pid in pipeline_ids:
+            try:
+                m = await client.get_pipeline(req.workspace_id, pid)
+                pipeline_meta_map[pid] = m.get("displayName", "Unknown")
+            except:
+                pipeline_meta_map[pid] = "Unknown"
     else:
         pipelines = await client.list_pipelines(req.workspace_id)
         pipeline_ids = [p["id"] for p in pipelines]
+        pipeline_meta_map = {p["id"]: p.get("displayName", "Unknown") for p in pipelines}
 
     configs = []
     errors = []
@@ -793,12 +778,13 @@ async def discover_pipelines(req: DiscoveryRequest):
 
     for pid in pipeline_ids:
         try:
+            p_name = pipeline_meta_map.get(pid, "Unknown")
             try:
                 pipe_def = await client.export_pipeline(req.workspace_id, pid)
             except Exception:
                 pipe_def = await client.get_pipeline(req.workspace_id, pid)
 
-            config = engine.analyze_pipeline(pipe_def, ws_name)
+            config = engine.analyze_pipeline(pipe_def, ws_name, p_name=p_name, p_id=pid)
             configs.append(config.dict())
             
             # Aggregate dependencies for summary
@@ -835,20 +821,94 @@ async def export_pipeline(req: ExportRequest):
     except Exception:
         ws_name = req.workspace_id
 
-    # Get full pipeline definition (Fabric export API)
+    # 1. Validate pipeline ID against current workspace (Metadata Check)
     try:
+        # Instead of listing all (which might be paged), we check the specific ID metadata
+        # If this fails with 404, the pipeline is invalid or unavailable.
+        try:
+            pipe_meta = await client.get_pipeline(req.workspace_id, req.pipeline_id)
+        except HTTPException as he:
+            if he.status_code == 404:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Selected pipeline is no longer available in workspace"
+                )
+            raise he
+            
+        # 2. Fetch Definition
         pipe_def = await client.export_pipeline(req.workspace_id, req.pipeline_id)
-    except Exception:
-        pipe_def = await client.get_pipeline(req.workspace_id, req.pipeline_id)
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Export validation or fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    config = engine.analyze_pipeline(pipe_def, ws_name)
+    # 3. Use metadata for the pipeline name
+    pipeline_name = pipe_meta.get("displayName") or pipe_meta.get("name") or "Unknown"
 
-    zip_path = export_engine.create_deep_export([config], [pipe_def])
+    # Explicitly extract the verbatim pipeline definition part (pipeline-content.json)
+    import base64
+    pipeline_json = {}
+    if "definition" in pipe_def and "parts" in pipe_def["definition"]:
+        for part in pipe_def["definition"]["parts"]:
+            if part.get("path") == "pipeline-content.json":
+                try:
+                    payload = part.get("payload", "")
+                    pipeline_json = json.loads(base64.b64decode(payload).decode('utf-8'))
+                    break
+                except Exception as e:
+                    logger.error(f"Failed to decode pipeline-content.json payload: {e}")
+
+    # 3. Use metadata for the pipeline name
+    pipeline_name = pipe_meta.get("displayName") or pipe_meta.get("name") or "Unknown"
+
+    # 4. Construct the Full ARM Deployment Template (api_ingestion.json)
+    # This matches the native Fabric Home -> Export behavior
+    arm_template = {
+        "$schema": "http://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+        "contentVersion": "1.0.0.0",
+        "parameters": pipeline_json.get("parameters", {}),
+        "variables": pipeline_json.get("variables", {}),
+        "resources": [
+            {
+                "name": pipeline_name,
+                "type": "pipelines",
+                "apiVersion": "2018-06-01",
+                "properties": pipeline_json.get("properties", pipeline_json),
+                "dependsOn": []
+            }
+        ]
+    }
+
+    # 5. Explicitly construct manifest.json
+    manifest = {
+        "displayName": pipeline_name,
+        "type": "DataPipeline",
+        "workspaceId": req.workspace_id,
+        "itemId": req.pipeline_id
+    }
+
+    # 6. Write files to disk as requested
+    try:
+        with open("api_ingestion.json", "w", encoding="utf-8") as f:
+            json.dump(arm_template, f, indent=2)
+        with open("manifest.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to write files to disk: {e}")
+
+    # 7. Generate the ZIP for download
+    # We use a custom zip creation here to ensure exact filenames
+    tmp_dir = tempfile.mkdtemp()
+    zip_path = os.path.join(tmp_dir, f"{pipeline_name}_export.zip")
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("api_ingestion.json", json.dumps(arm_template, indent=2))
+        zf.writestr("manifest.json", json.dumps(manifest, indent=2))
 
     return FileResponse(
         zip_path,
         media_type="application/zip",
-        filename=f"deep_export_{config.pipeline_name}.zip"
+        filename=f"{pipeline_name}_export.zip"
     )
 
 @app.post("/export/bulk")
@@ -871,26 +931,24 @@ async def export_all_pipelines(req: DiscoveryRequest):
         pipelines = await client.list_pipelines(req.workspace_id)
         pipeline_ids = [p["id"] for p in pipelines]
 
-    configs = []
+    metadata_list = []
     raw_defs = []
 
     for pid in pipeline_ids:
         try:
-            try:
-                pipe_def = await client.export_pipeline(req.workspace_id, pid)
-            except Exception:
-                pipe_def = await client.get_pipeline(req.workspace_id, pid)
+            # Fetch both metadata and definition
+            pipe_meta = await client.get_pipeline(req.workspace_id, pid)
+            pipe_def = await client.export_pipeline(req.workspace_id, pid)
 
-            config = engine.analyze_pipeline(pipe_def, ws_name)
-            configs.append(config)
+            metadata_list.append(pipe_meta)
             raw_defs.append(pipe_def)
         except Exception as e:
             logger.error(f"Skipping pipeline {pid}: {e}")
 
-    if not configs:
+    if not raw_defs:
         raise HTTPException(status_code=404, detail="No pipelines found or accessible.")
 
-    zip_path = export_engine.create_deep_export(configs, raw_defs)
+    zip_path = export_engine.create_deep_export(metadata_list, raw_defs)
 
     return FileResponse(
         zip_path,
