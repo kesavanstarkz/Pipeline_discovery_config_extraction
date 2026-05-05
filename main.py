@@ -3,7 +3,7 @@ Fabric Pipeline Discovery Agent - FastAPI Backend
 Connects to Microsoft Fabric via Azure SSO (MSAL)
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -12,12 +12,15 @@ import json
 import os
 import zipfile
 import tempfile
+import asyncio
 import uuid
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Annotated
 from pydantic import BaseModel
 import logging
 from dotenv import load_dotenv
+
+from pipeline_parser import parse_pipeline_zip, remap_pipeline
 
 load_dotenv()
 
@@ -146,19 +149,165 @@ class FabricClient:
         return data.get("value", [])
 
     async def get_pipeline(self, workspace_id: str, pipeline_id: str) -> Dict:
-        return await self.get(
-            f"{FABRIC_API_BASE}/workspaces/{workspace_id}/dataPipelines/{pipeline_id}"
-        )
+        """Get pipeline metadata"""
+        return await self.get(f"{FABRIC_API_BASE}/workspaces/{workspace_id}/items/{pipeline_id}")
 
-    async def export_pipeline(self, workspace_id: str, pipeline_id: str) -> Dict:
+    async def create_pipeline(self, workspace_id: str, pipeline_name: str, pipeline_definition: dict) -> Dict:
+        """Create a pipeline in the specified workspace using the pipeline definition."""
+        import base64
+        url = f"{FABRIC_API_BASE}/workspaces/{workspace_id}/items"
+
+        definition_bytes = json.dumps(pipeline_definition, indent=2).encode("utf-8")
+        definition_b64 = base64.b64encode(definition_bytes).decode("utf-8")
+
+        payload = {
+            "displayName": pipeline_name,
+            "type": "DataPipeline",
+            "definition": {
+                "parts": [
+                    {
+                        "path": "pipeline-content.json",
+                        "payload": definition_b64,
+                        "payloadType": "InlineBase64",
+                    }
+                ]
+            },
+        }
+        return await self.post(url, payload)
+
+    async def update_pipeline_definition(self, workspace_id: str, pipeline_id: str, pipeline_definition: dict) -> Dict:
+        """Update an existing pipeline's definition in the workspace."""
+        import base64
+        url = f"{FABRIC_API_BASE}/workspaces/{workspace_id}/items/{pipeline_id}/updateDefinition"
+
+        definition_bytes = json.dumps(pipeline_definition, indent=2).encode("utf-8")
+        definition_b64 = base64.b64encode(definition_bytes).decode("utf-8")
+
+        payload = {
+            "definition": {
+                "parts": [
+                    {
+                        "path": "pipeline-content.json",
+                        "payload": definition_b64,
+                        "payloadType": "InlineBase64",
+                    }
+                ]
+            }
+        }
+        # updateDefinition returns 200 OK (synchronous if small, LRO if large, but we'll assume sync for pipelines)
+        return await self.post(url, payload)
+
+    async def bulk_export_pipelines(self, workspace_id: str, pipeline_ids: List[str]) -> Dict[str, Dict[str, bytes]]:
         """
-        Uses Fabric's generic Item API to get the full export-ready definition.
-        Format 'Fabric' ensures parameter references are preserved.
+        Exports multiple pipelines using bulkExportDefinitions LRO.
         """
-        return await self.post(
-            f"{FABRIC_API_BASE}/workspaces/{workspace_id}/items/{pipeline_id}/getDefinition",
-            {"format": "Fabric"}
-        )
+        url = f"{FABRIC_API_BASE}/workspaces/{workspace_id}/items/bulkExportDefinitions?beta=true"
+        payload = {
+            "mode": "Selective",
+            "items": [{"id": pid, "type": "DataPipeline"} for pid in pipeline_ids]
+        }
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            logger.info(f"Triggering bulk export for {len(pipeline_ids)} pipelines...")
+            resp = await client.post(url, headers=self.headers, json=payload)
+            if not resp.is_success:
+                error_body = resp.text
+                logger.error(f"bulkExportDefinitions failed: {resp.status_code} - {error_body}")
+                if resp.status_code == 401:
+                    raise HTTPException(status_code=401, detail="Token expired or invalid.")
+                if resp.status_code == 403:
+                    raise HTTPException(status_code=403, detail="Insufficient scopes for export.")
+                if resp.status_code == 400:
+                    raise HTTPException(status_code=400, detail=f"Bad Request: {error_body}")
+                resp.raise_for_status()
+            
+            location_url = resp.headers.get("Location")
+            if not location_url:
+                raise Exception("Location header missing from export response.")
+                
+            retry_after = int(resp.headers.get("Retry-After", 2))
+            
+            # Poll LRO
+            while True:
+                await asyncio.sleep(retry_after)
+                poll_resp = await client.get(location_url, headers=self.headers)
+                poll_resp.raise_for_status()
+                if poll_resp.status_code == 200:
+                    status_data = poll_resp.json()
+                    status = status_data.get("status", "Unknown")
+                    logger.info(f"LRO Status: {status}")
+                    if status == "Succeeded":
+                        break
+                    elif status in ("Failed", "Canceled"):
+                        raise Exception(f"Export operation failed: {json.dumps(status_data)}")
+                retry_after = int(poll_resp.headers.get("Retry-After", 2))
+                
+            # Fetch Result
+            result_url = f"{location_url}/result"
+            res_resp = await client.get(result_url, headers=self.headers)
+            res_resp.raise_for_status()
+            result_data = res_resp.json()
+            
+            results = {}
+            import base64
+            
+            item_index = result_data.get("itemDefinitionsIndex", [])
+            definition_parts = result_data.get("definitionParts", [])
+            
+            if not item_index:
+                raise Exception("itemDefinitionsIndex missing from LRO result data.")
+            if not definition_parts:
+                raise Exception("definitionParts missing from LRO result data.")
+                
+            for idx_entry in item_index:
+                pid = idx_entry.get("id")
+                root_path = idx_entry.get("rootPath")
+                
+                if not pid or not root_path:
+                    logger.error(f"Invalid itemDefinitionsIndex entry: {idx_entry}")
+                    continue
+                    
+                files = {}
+                for part in definition_parts:
+                    path = part.get("path", "")
+                    if path.startswith(root_path):
+                        # Calculate relative path within the pipeline folder
+                        # Example: path = "/Pipeline.DataPipeline/.platform"
+                        # root_path = "/Pipeline.DataPipeline"
+                        # rel_path = ".platform"
+                        rel_path = path[len(root_path):].lstrip("/")
+                        
+                        payload_b64 = part.get("payload", "")
+                        try:
+                            content = base64.b64decode(payload_b64)
+                        except Exception as e:
+                            logger.error(f"Failed to decode base64 for {path}: {e}")
+                            continue
+                            
+                        # Transform naming to exactly match Fabric UI export structure
+                        if rel_path == "pipeline-content.json":
+                            files["pipeline.json"] = content
+                        elif rel_path == "item.metadata.json":
+                            try:
+                                metadata = json.loads(content)
+                                pipe_name = metadata.get("displayName", f"Pipeline_{pid[:8]}")
+                                manifest = {
+                                    "name": pipe_name,
+                                    "type": "DataPipeline",
+                                    "properties": metadata
+                                }
+                                files["manifest.json"] = json.dumps(manifest, indent=2).encode('utf-8')
+                            except:
+                                files["manifest.json"] = content
+                        else:
+                            files[rel_path] = content
+                            
+                if not files:
+                    logger.warning(f"No definitionParts matched rootPath {root_path} for pipeline {pid}")
+                    
+                results[pid] = files
+                
+            return results
 
     async def get_workspace_info(self, workspace_id: str) -> Dict:
         return await self.get(f"{FABRIC_API_BASE}/workspaces/{workspace_id}")
@@ -578,86 +727,6 @@ class ExportEngine:
         search(raw)
         return {k: list(v) for k, v in deps.items()}
 
-    def _generate_import_guide(self) -> str:
-        return """# Import Logic
-To rebuild this workspace, follow this order:
-1. **linkedServices/**
-2. **datasets/**
-3. **dataflows/** (if any)
-4. **pipelines/**
-
-Use the Fabric REST API:
-- POST `/linkedServices`
-- POST `/datasets`
-- POST `/dataPipelines`
-"""
-
-    def _generate_readme(self, config: PipelineConfig) -> str:
-        ing = config.ingestion_metadata
-        return f"""# Pipeline: {config.pipeline_name}
-
-## Overview
-- **Pipeline ID**: {config.pipeline_id}
-- **Workspace**: {config.workspace_name}
-- **Discovered**: {config.discovered_at}
-
-## Ingestion Configuration
-| Property | Value |
-|----------|-------|
-| Source | {ing.source} |
-| Ingestion Type | {ing.ingestion_type} |
-| Trigger Type | {ing.trigger_type} |
-| Load Type | {ing.load_type} |
-| Schedule | {ing.ingestion_frequency or 'N/A'} |
-| File Pattern | {ing.file_name_pattern or 'N/A'} |
-
-## File Structures
-{self._format_schema_table(config.file_structures)}
-
-## How to Import
-See `HOW_TO_IMPORT.md` in the root of this ZIP.
-"""
-
-    def _format_schema_table(self, structures: List[FileStructure]) -> str:
-        out = ""
-        for fs in structures:
-            out += f"\n### {fs.file_type}\n"
-            out += "| Column | Type | Mandatory | Format | Order |\n"
-            out += "|--------|------|-----------|--------|-------|\n"
-            for col in fs.columns:
-                out += f"| {col.name} | {col.data_type} | {'Yes' if col.is_mandatory else 'No'} | {col.format or '-'} | {col.order} |\n"
-        return out
-
-    def _import_guide(self) -> str:
-        return """# How to Import Pipelines into Microsoft Fabric
-
-## Method 1: Fabric UI Import
-1. Open Microsoft Fabric (app.fabric.microsoft.com)
-2. Navigate to your target Workspace
-3. Click **+ New** → **Data Pipeline**
-4. Select **Import** and upload `pipeline_definition.json`
-5. Update linked services / credentials as needed
-
-## Method 2: Fabric REST API
-```bash
-curl -X POST \\
-  "https://api.fabric.microsoft.com/v1/workspaces/{WORKSPACE_ID}/dataPipelines/import" \\
-  -H "Authorization: Bearer {YOUR_TOKEN}" \\
-  -H "Content-Type: application/json" \\
-  -d @pipeline_definition.json
-```
-
-## Method 3: Azure DevOps / CI-CD
-Place `pipeline_definition.json` in your repo and use the Fabric REST API
-in your pipeline YAML to auto-deploy on merge.
-
-## After Import
-- Review `metadata.json` for ingestion settings
-- Review `schema.json` to validate column mappings
-- Update connection strings / credentials in Fabric Settings
-"""
-
-
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
 engine = DiscoveryEngine()
@@ -811,7 +880,7 @@ async def discover_pipelines(req: DiscoveryRequest):
 async def export_pipeline(req: ExportRequest):
     """
     Export a single pipeline as a portable ZIP package.
-    The ZIP can be imported into any Fabric workspace — no rebuild needed.
+    Uses native bulkExportDefinitions LRO for 1:1 exact compatibility.
     """
     client = FabricClient(req.access_token)
 
@@ -821,137 +890,44 @@ async def export_pipeline(req: ExportRequest):
     except Exception:
         ws_name = req.workspace_id
 
-    # 1. Validate pipeline ID against current workspace (Metadata Check)
     try:
-        # Instead of listing all (which might be paged), we check the specific ID metadata
-        # If this fails with 404, the pipeline is invalid or unavailable.
-        try:
-            pipe_meta = await client.get_pipeline(req.workspace_id, req.pipeline_id)
-        except HTTPException as he:
-            if he.status_code == 404:
-                raise HTTPException(
-                    status_code=400, 
-                    detail="Selected pipeline is no longer available in workspace"
-                )
-            raise he
-            
-        # 2. Fetch Definition
-        pipe_def = await client.export_pipeline(req.workspace_id, req.pipeline_id)
+        # Check if pipeline exists to grab metadata
+        pipe_meta = await client.get_pipeline(req.workspace_id, req.pipeline_id)
+        pipeline_name = pipe_meta.get("displayName") or pipe_meta.get("name") or "Pipeline"
     except HTTPException as he:
+        if he.status_code == 404:
+            raise HTTPException(status_code=400, detail="Selected pipeline is no longer available in workspace")
         raise he
     except Exception as e:
-        logger.error(f"Export validation or fetch failed: {e}")
+        logger.error(f"Export validation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    # 3. Use metadata for the pipeline name
-    pipeline_name = pipe_meta.get("displayName") or pipe_meta.get("name") or "Unknown"
-
-    # 2. Extract verbatim parts (Pipeline Definition, Manifest, and SVG)
-    import base64
-    parts_map = {}
-    exported_svg = ""
-    manifest_obj = {}
-
-    if "definition" in pipe_def and "parts" in pipe_def["definition"]:
-        for part in pipe_def["definition"]["parts"]:
-            path = part.get("path", "")
-            try:
-                payload_raw = part.get("payload", "")
-                payload = base64.b64decode(payload_raw).decode('utf-8')
-                parts_map[path] = payload
-                
-                # Capture SVG if found in any part
-                if path.lower().endswith(".svg") or "image" in path.lower():
-                    exported_svg = payload
-                
-                # Capture Manifest if found
-                if path == "manifest.json":
-                    try:
-                        manifest_obj = json.loads(payload)
-                    except:
-                        pass
-            except:
-                continue
-
-    # Identify core pipeline file
-    # Fabric items usually have a main content file. For pipelines it's pipeline-content.json
-    pipeline_json_str = parts_map.get("pipeline-content.json", "{}")
-    pipeline_json = json.loads(pipeline_json_str)
-
-    # 3. Use metadata for the pipeline name
-    pipeline_name = pipe_meta.get("displayName") or pipe_meta.get("name") or "Unknown"
-
-    # 4. Auto-detect all [parameters('...')] references (Aggressive Search)
-    import re
-    # Matches [parameters('name')], [ parameters( "name" ) ], etc.
-    param_pattern = r"\[\s*parameters\s*\(\s*['\"]([^'\"]+)['\"]\s*\)\s*\]"
-    detected_params = re.findall(param_pattern, pipeline_json_str)
-    
-    # Initialize parameters block
-    final_parameters = pipeline_json.get("parameters", {})
-    for p_name in set(detected_params):
-        if p_name not in final_parameters:
-            final_parameters[p_name] = {"type": "string"}
-
-    # 5. Construct the Full ARM Deployment Template (api_ingestion.json)
-    # This matches the native Fabric Home -> Export behavior
-    arm_template = {
-        "$schema": "http://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
-        "contentVersion": "1.0.0.0",
-        "parameters": final_parameters,
-        "variables": pipeline_json.get("variables", {}),
-        "resources": [
-            {
-                "name": pipeline_name,
-                "type": "pipelines",
-                "apiVersion": "2018-06-01",
-                "properties": pipeline_json.get("properties", pipeline_json),
-                "dependsOn": []
-            }
-        ]
-    }
-
-    # 6. Explicitly construct/preserve manifest.json
-    if not manifest_obj:
-        manifest_obj = {
-            "name": pipeline_name,
-            "image": exported_svg or "" 
-        }
-    else:
-        # Prioritize the image we found in parts if manifest.json was incomplete
-        if not manifest_obj.get("image") and exported_svg:
-            manifest_obj["image"] = exported_svg
-        if "name" not in manifest_obj:
-            manifest_obj["name"] = pipeline_name
-
-    # 7. Write files to disk as requested
     try:
-        with open("api_ingestion.json", "w", encoding="utf-8") as f:
-            json.dump(arm_template, f, indent=2)
-        with open("manifest.json", "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2)
+        results = await client.bulk_export_pipelines(req.workspace_id, [req.pipeline_id])
+        if req.pipeline_id not in results:
+            raise Exception("Export succeeded but pipeline was not found in result.")
+        files = results[req.pipeline_id]
+        
+        tmp_dir = tempfile.mkdtemp()
+        zip_path = os.path.join(tmp_dir, f"{pipeline_name}_export.zip")
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for filepath, content in files.items():
+                zf.writestr(filepath, content)
+                
+        return FileResponse(
+            zip_path,
+            media_type="application/zip",
+            filename=f"{pipeline_name}_export.zip"
+        )
     except Exception as e:
-        logger.warning(f"Failed to write files to disk: {e}")
-
-    # 7. Generate the ZIP for download
-    # We use a custom zip creation here to ensure exact filenames
-    tmp_dir = tempfile.mkdtemp()
-    zip_path = os.path.join(tmp_dir, f"{pipeline_name}_export.zip")
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("api_ingestion.json", json.dumps(arm_template, indent=2))
-        zf.writestr("manifest.json", json.dumps(manifest_obj, indent=2))
-
-    return FileResponse(
-        zip_path,
-        media_type="application/zip",
-        filename=f"{pipeline_name}_export.zip"
-    )
+        logger.error(f"Export fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/export/bulk")
 async def export_all_pipelines(req: DiscoveryRequest):
     """
-    Export ALL pipelines in a workspace as one ZIP package.
-    Perfect for workspace migration or sharing with a team.
+    Export ALL pipelines in a workspace as one ZIP package using bulkExportDefinitions.
+    Each pipeline is stored in its own folder.
     """
     client = FabricClient(req.access_token)
 
@@ -967,30 +943,28 @@ async def export_all_pipelines(req: DiscoveryRequest):
         pipelines = await client.list_pipelines(req.workspace_id)
         pipeline_ids = [p["id"] for p in pipelines]
 
-    metadata_list = []
-    raw_defs = []
-
-    for pid in pipeline_ids:
-        try:
-            # Fetch both metadata and definition
-            pipe_meta = await client.get_pipeline(req.workspace_id, pid)
-            pipe_def = await client.export_pipeline(req.workspace_id, pid)
-
-            metadata_list.append(pipe_meta)
-            raw_defs.append(pipe_def)
-        except Exception as e:
-            logger.error(f"Skipping pipeline {pid}: {e}")
-
-    if not raw_defs:
+    if not pipeline_ids:
         raise HTTPException(status_code=404, detail="No pipelines found or accessible.")
 
-    zip_path = export_engine.create_deep_export(metadata_list, raw_defs)
-
-    return FileResponse(
-        zip_path,
-        media_type="application/zip",
-        filename=f"bulk_deep_export_{ws_name}.zip"
-    )
+    try:
+        results = await client.bulk_export_pipelines(req.workspace_id, pipeline_ids)
+        
+        tmp_dir = tempfile.mkdtemp()
+        zip_path = os.path.join(tmp_dir, f"bulk_deep_export_{ws_name}.zip")
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for pid, files in results.items():
+                for filepath, content in files.items():
+                    # Prefix with the pipeline ID or pipeline name folder to prevent collisions
+                    zf.writestr(f"{pid}/{filepath}", content)
+                    
+        return FileResponse(
+            zip_path,
+            media_type="application/zip",
+            filename=f"bulk_deep_export_{ws_name}.zip"
+        )
+    except Exception as e:
+        logger.error(f"Bulk export failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/analyze/schema")
 async def analyze_schema(payload: Dict[str, Any]):
@@ -1017,6 +991,101 @@ async def analyze_schema(payload: Dict[str, Any]):
             ))
 
     return config.dict()
+
+# ─── Deployment Endpoints ────────────────────────────────────────────────────────
+
+@app.post("/deploy/parse", tags=["Deployment"])
+async def parse_pipeline_endpoint(
+    zip_file: UploadFile = File(..., description="Fabric pipeline ZIP exported from Fabric UI"),
+):
+    """Parse the ZIP and return all detected metadata (Dry-run)."""
+    raw = await zip_file.read()
+    try:
+        parsed = parse_pipeline_zip(raw)
+    except Exception as e:
+        logger.error(f"Failed to parse ZIP: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Failed to parse ZIP: {str(e)}")
+    
+    # We remove raw_definition from the response because it's too verbose
+    parsed.pop("raw_definition", None)
+    return parsed
+
+@app.post("/deploy/execute", tags=["Deployment"])
+async def deploy_pipeline_endpoint(
+    zip_file: Annotated[UploadFile, File(description="Fabric pipeline ZIP exported from Fabric UI")],
+    access_token: Annotated[str, Form(description="Azure AD Token")],
+    target_workspace_id: Annotated[str, Form(description="Target Fabric Workspace ID (GUID)")],
+    pipeline_name: Annotated[Optional[str], Form(description="Override pipeline display name.")] = None,
+    id_mappings_json: Annotated[Optional[str], Form(description="JSON object mapping OLD IDs to NEW IDs.")] = None,
+):
+    """Deploy any Fabric pipeline ZIP to a target workspace."""
+    id_mappings: dict[str, str] = {}
+    if id_mappings_json and id_mappings_json.strip():
+        try:
+            parsed_map = json.loads(id_mappings_json)
+            if not isinstance(parsed_map, dict):
+                raise ValueError("Must be a JSON object (key-value pairs)")
+            id_mappings = {str(k): str(v) for k, v in parsed_map.items() if k and v}
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"id_mappings_json parse error: {str(e)}")
+
+    raw = await zip_file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    try:
+        parsed = parse_pipeline_zip(raw)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse ZIP: {str(e)}")
+
+    remapped_definition = remap_pipeline(parsed["raw_definition"], id_mappings)
+    final_name = (pipeline_name or "").strip() or parsed["pipeline_name"]
+
+    client = FabricClient(access_token)
+    try:
+        result = await client.create_pipeline(
+            workspace_id=target_workspace_id,
+            pipeline_name=final_name,
+            pipeline_definition=remapped_definition,
+        )
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 409:
+            logger.info(f"Pipeline '{final_name}' already exists. Attempting to update instead...")
+            # Fetch existing pipelines to find the ID
+            try:
+                pipelines = await client.list_pipelines(target_workspace_id)
+                existing_pid = next((p.get("id") for p in pipelines if p.get("displayName") == final_name), None)
+                
+                if not existing_pid:
+                    raise Exception(f"Could not find existing pipeline '{final_name}' to update despite 409 Conflict.")
+                    
+                result = await client.update_pipeline_definition(
+                    workspace_id=target_workspace_id,
+                    pipeline_id=existing_pid,
+                    pipeline_definition=remapped_definition,
+                )
+            except Exception as update_err:
+                logger.error(f"Failed to update existing pipeline '{final_name}': {str(update_err)}")
+                raise HTTPException(status_code=409, detail=f"Pipeline '{final_name}' already exists and update failed: {str(update_err)}")
+        else:
+            logger.error(f"Pipeline deployment failed: {e.response.text}")
+            raise HTTPException(status_code=e.response.status_code, detail=f"Pipeline deployment failed: {e.response.text}")
+    except Exception as e:
+        if "403" in str(e):
+            # Fallback if the HTTPException doesn't get caught properly
+            raise HTTPException(status_code=403, detail=str(e))
+        if hasattr(e, "status_code"):
+            raise e
+        logger.error(f"Pipeline deployment failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Pipeline deployment failed: {str(e)}")
+
+    return {
+        "success": True,
+        "pipeline_name": final_name,
+        "target_workspace_id": target_workspace_id,
+        "fabric_response": result,
+        "activities_deployed": [a["name"] for a in parsed.get("activities", [])],
+        "ids_remapped": len(id_mappings),
+    }
 
 if __name__ == "__main__":
     import uvicorn
