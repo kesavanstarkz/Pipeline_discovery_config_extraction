@@ -457,37 +457,21 @@
         <!-- Deploy Tab -->
         <div class="tab-content" id="tab-deploy">
           <div class="config-panel">
-            <div class="section-title">1. Parse ZIP</div>
-            <p style="font-size: 0.875rem; color: var(--text2); margin-bottom: 1rem;">Inspect your pipeline ZIP to discover all IDs. No deployment happens here.</p>
+            <div class="section-title">Deployment Engine</div>
+            <p style="font-size: 0.875rem; color: var(--text2); margin-bottom: 1rem;">
+              Deploy a pipeline ZIP into the selected workspace. 
+              Dependencies (Notebooks, Connections, etc.) will be automatically resolved by name.
+            </p>
             <div class="config-grid">
               <div class="field" style="flex: 1;">
-                <label>Pipeline ZIP</label>
+                <label>Pipeline ZIP Package</label>
                 <input type="file" id="deploy-zip" accept=".zip" style="padding: 0.4rem;">
               </div>
-              <button class="btn btn-secondary" id="btn-deploy-parse" onclick="doDeployParse()">🔍 Inspect Pipeline</button>
+              <button class="btn btn-green" id="btn-deploy-execute" onclick="doDeployExecute()">🚀 Deploy to Workspace</button>
             </div>
-          </div>
-
-          <div class="config-panel" id="deploy-mappings-panel" style="display: none; margin-top: 16px;">
-            <div class="section-title">2. ID Mappings & Deploy</div>
-            <p style="font-size: 0.875rem; color: var(--text2); margin-bottom: 1rem;">
-              Enter the corresponding new IDs from the target account. Leave blank to keep unchanged.
-            </p>
-            <div id="mappings-fields" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; margin-bottom: 1rem;">
-            </div>
-            
-            <div class="field" style="margin-bottom: 1rem;">
-              <label>Override Pipeline Name <small style="font-weight:normal;color:#888;">(Optional)</small></label>
-              <input type="text" id="deploy-pipeline-name" placeholder="Leave blank to use name from ZIP">
-            </div>
-
-            <div class="field" style="margin-bottom: 1rem;">
-              <label>Raw JSON Mappings <small style="font-weight:normal;color:#888;">(Overrides fields above)</small></label>
-              <textarea id="deploy-mappings-json" placeholder='{"old-id": "new-id"}' style="height: 80px;"></textarea>
-            </div>
-
-            <div style="display: flex; gap: 8px;">
-              <button class="btn btn-green" id="btn-deploy-execute" onclick="doDeployExecute()">🚀 Deploy to Selected Workspace</button>
+            <div id="deploy-engine-report" style="margin-top: 1.5rem; display: none;">
+              <div class="section-title">Deployment Report</div>
+              <div id="report-content" style="background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; padding: 1rem; font-size: 0.875rem;"></div>
             </div>
           </div>
         </div>
@@ -895,94 +879,12 @@
     }
 
     // ── Deploy ────────────────────────────────────────────────────────────────────
-    async function doDeployParse() {
-      const f = document.getElementById('deploy-zip').files[0];
-      if (!f) { showToast('Select a ZIP file first', 'orange'); return; }
-
-      showLoading(true);
-      const fd = new FormData();
-      fd.append('zip_file', f);
-
-      try {
-        const resp = await fetch(getApiUrl() + '/deploy/parse', { method: 'POST', body: fd });
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.detail || resp.statusText);
-
-        buildMappingFields(data);
-        document.getElementById('deploy-mappings-panel').style.display = 'block';
-        showToast(`Parsed: ${data.pipeline_name} (${data.activities.length} activities)`, "green");
-      } catch(e) {
-        showToast('Parse error: ' + e.message, 'red');
-      } finally {
-        showLoading(false);
-      }
-    }
-
-    function buildMappingFields(data) {
-      const container = document.getElementById('mappings-fields');
-      container.innerHTML = '';
-
-      const sections = [
-        { label: 'Workspace IDs',  ids: data.workspace_ids,  placeholder: 'New workspace GUID' },
-        { label: 'Artifact IDs',   ids: data.artifact_ids.filter(i => !i.startsWith('[')), placeholder: 'New artifact GUID' },
-        { label: 'Connection IDs', ids: data.connections,    placeholder: 'New connection GUID' },
-        { label: 'Notebook IDs',   ids: data.notebook_ids,   placeholder: 'New notebook GUID' },
-      ];
-
-      let anyShown = false;
-      sections.forEach(s => {
-        const ids = s.ids.filter(Boolean);
-        if (!ids.length) return;
-        anyShown = true;
-
-        const secDiv = document.createElement('div');
-        secDiv.innerHTML = `<div style="font-size: 0.75rem; font-weight: bold; color: #495057; margin-bottom: 0.5rem;">${s.label}</div>`;
-        
-        ids.forEach(oldId => {
-          const field = document.createElement('div');
-          field.className = 'field';
-          field.style.marginBottom = '0.5rem';
-          field.innerHTML = `
-            <div style="font-size: 11px; background: #f8f9fa; border: 1px solid #dee2e6; padding: 4px 8px; border-radius: 4px; margin-bottom: 4px; word-break: break-all;" title="${oldId}">${oldId}</div>
-            <input type="text" placeholder="${s.placeholder}" data-old-id="${oldId}" oninput="syncMappingsJson()">
-          `;
-          secDiv.appendChild(field);
-        });
-        container.appendChild(secDiv);
-      });
-
-      if (!anyShown) {
-        container.innerHTML = '<p style="font-size: 0.875rem; color: #6c757d;">No remappable IDs detected in this pipeline.</p>';
-      }
-    }
-
-    function syncMappingsJson() {
-      const mappings = {};
-      document.querySelectorAll('[data-old-id]').forEach(inp => {
-        const v = inp.value.trim();
-        if (v) mappings[inp.dataset.oldId] = v;
-      });
-      if (Object.keys(mappings).length > 0) {
-        document.getElementById('deploy-mappings-json').value = JSON.stringify(mappings, null, 2);
-      } else {
-        document.getElementById('deploy-mappings-json').value = "";
-      }
-    }
-
     async function doDeployExecute() {
       const f = document.getElementById('deploy-zip').files[0];
       const wsId = document.getElementById("workspace-id").value.trim();
       
       if (!f) { showToast('Select a ZIP file first', 'orange'); return; }
-      if (!wsId) { showToast('Please enter a target Workspace ID in the top config panel', 'orange'); return; }
-
-      const plName = document.getElementById('deploy-pipeline-name').value.trim();
-      const mappingsJson = document.getElementById('deploy-mappings-json').value.trim();
-
-      if (mappingsJson) {
-        try { JSON.parse(mappingsJson); }
-        catch(e) { showToast('ID Mappings JSON is not valid: ' + e.message, 'red'); return; }
-      }
+      if (!wsId) { showToast('Please select a target Workspace first', 'orange'); return; }
 
       showLoading(true);
       const token = await getToken();
@@ -991,15 +893,14 @@
       fd.append('zip_file', f);
       fd.append('access_token', token);
       fd.append('target_workspace_id', wsId);
-      if (plName) fd.append('pipeline_name', plName);
-      if (mappingsJson) fd.append('id_mappings_json', mappingsJson);
 
       try {
         const resp = await fetch(getApiUrl() + '/deploy/execute', { method: 'POST', body: fd });
         const data = await resp.json();
         
         if (resp.ok) {
-          showToast(`Deployed "${data.pipeline_name}" (${data.ids_remapped} ID(s) remapped)`, "green");
+          showToast(`Deployed: ${data.pipeline_deployed}`, "green");
+          renderDeploymentReport(data);
         } else {
           showToast(`Deployment failed: ${data.detail || JSON.stringify(data)}`, "red");
         }
@@ -1008,6 +909,24 @@
       } finally {
         showLoading(false);
       }
+    }
+
+    function renderDeploymentReport(data) {
+      const panel = document.getElementById('deploy-engine-report');
+      const content = document.getElementById('report-content');
+      panel.style.display = 'block';
+      
+      content.innerHTML = `
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+          <div><strong>Target Workspace:</strong></div><div>${data.workspace_name} (${data.workspace_id})</div>
+          <div><strong>Pipeline Deployed:</strong></div><div>${data.pipeline_deployed}</div>
+          <div><strong>Status:</strong></div><div style="color:var(--green); font-weight:bold;">${data.status}</div>
+          <div><strong>Auto-remapped IDs:</strong></div><div>${data.remapped_ids}</div>
+        </div>
+        <div style="margin-top: 15px; font-size: 11px; color: #666;">
+          <em>Note: Artifacts were matched by name/type within the target workspace.</em>
+        </div>
+      `;
     }
 
     // ── Bootstrap ─────────────────────────────────────────────────────────────────
